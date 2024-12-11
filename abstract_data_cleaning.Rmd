@@ -1,0 +1,240 @@
+---
+title: "abstract_univariate_analysis"
+output: html_document
+date: "2024-11-12"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(patchwork)
+library(ggsignif)
+library(tidymodels)
+library(fastDummies)
+library(pROC)
+library(ggmosaic)
+library(readxl)
+library(gt)
+library(knitr)
+```
+
+# Data and Preprocessing
+```{r clinical_data}
+mpt <- read_csv('raw_data/Table_S1_MPT_v1_forWill.csv') |> 
+  clean_names() |> 
+  select(-ends_with('availability'))
+
+mst <- read_csv('raw_data/Table_S2_MST_clinical_v2_forWill.csv') |> 
+  clean_names() |> 
+  select(-starts_with('include'))
+
+clinical <- mst |> 
+  left_join(mpt) |> 
+  select(-her2_ihc, -number_of_primaries_in_cohort, ) |> 
+  select(response, everything()) |> 
+  mutate(race = fct_recode(race,
+                           'white' = 'White',
+                           'black' = 'Black or African American', 
+                           'nhpi' = 'Native Hawaiian/Pacific Islander',
+                           'asian' = 'Asian-Far East/Indian Subcont'),
+         ethnicity = fct_collapse(ethnicity, 
+                                  'unknown' = 'Unknown whether Spanish or not',
+                                  'non_hispanic' = 'Non- Spanish; Non- Hispanic',
+                                  other_level = 'hispanic'),
+         race = fct_collapse(race, 
+                             'other' = c('Other', 'Patient Refused to Answer', 'Unknown', 'nhpi')),
+         race = as.character(race),
+         race = ifelse(ethnicity == 'hispanic', 'hispanic', race),
+         nac_regimen_category = fct_recode(nac_regimen_category,
+                                           'ac_t' = 'AC-T',
+                                           'ac_tcb' = 'AC-TCb',
+                                           'ac_thp' = 'AC-THP',
+                                           'other' = 'Other Chemotherapy',
+                                           'other_and_anti_her2' = 'Other Chemotherapy and Anti-HER2 Therapy',
+                                           'tchp' = 'TCHP'),
+         family_history_of_breast_cancer = ifelse(str_detect(family_history_of_breast_cancer, "^Yes"), 1, 0),
+         family_history_of_ovarian_cancer = ifelse(str_detect(family_history_of_ovarian_cancer, "^Yes"), 1, 0),
+         ashkenazi_jewish_descent = ifelse(str_detect(ashkenazi_jewish_descent, "^Yes"), 1, 0),
+         histological_grade = fct_recode(histological_grade, 
+                                         'i_or_ii' = 'I or II',
+                                         'iii' = 'III'),
+         nuclear_grade = fct_recode(nuclear_grade, 
+                                         'i_or_ii' = 'I or II',
+                                         'iii' = 'III'),
+         histology = fct_recode(histology, 
+                                'idc' = 'IDC Histology',
+                                'ilc' = 'ILC Histology',
+                                'other' = 'Other Histology'),
+         er_percentage = fct_recode(er_percentage,
+                                    '0_1' = '0-1%',
+                                    '1_10' = '1-10%',
+                                    '10_50' = '10-50%',
+                                    '50_up' = '50%+',
+                                    'unknown' = 'Unknown'),
+         pr_percentage = fct_recode(pr_percentage,
+                                    '0_1' = '0-1%',
+                                    '1_10' = '1-10%',
+                                    '10_50' = '10-50%',
+                                    '50_up' = '50%+',
+                                    'unknown' = 'Unknown'),
+         her2_ihc_primary = fct_recode(her2_ihc_primary, 
+                                       '0_1' = '0-1+',
+                                       '1_2' = '1-2+',
+                                       '1' = '1+',
+                                       '2_3' = '2-3+',
+                                       '2' = '2+',
+                                       '3' = '3+',
+                                       'unknown' = 'Unknown / Not Done'),
+         her2_ihc_primary = case_when(
+           her2_ihc_primary == "0_1" ~ '1',
+           her2_ihc_primary == "1_2" ~ '2',
+           her2_ihc_primary == "2_3" ~ '3',
+           .default = her2_ihc_primary)) |> 
+  rename(age_at_dx = age_at_dx_date_of_breast_carcinoma,
+         nac_regimen = nac_regimen_category, 
+         fam_hist_ovarian = family_history_of_ovarian_cancer,
+         fam_hist_breast = family_history_of_breast_cancer,
+         ashkenazi_descent = ashkenazi_jewish_descent,
+         hist_grade = histological_grade,
+         nuc_grade = nuclear_grade,
+         pos_nodal_status = positive_nodal_status) |> 
+  select(-ethnicity) |> 
+  dummy_cols(select_columns = c('nac_regimen', 'her2_ihc_primary', 'er_percentage', 'pr_percentage', 'hist_grade', 'nuc_grade', 't_stage', 'c_stage', 'histology'), remove_selected_columns = TRUE) |> 
+  mutate(subtype = fct_recode(subtype,
+                              'HRposHER2neg' = 'HR+/HER2-',
+                              'HRnegHER2pos' = 'HR-/HER2+',
+                              'HRposHER2pos' = 'HR+/HER2+')) |> 
+  select(-nuc_grade_Unknown, -hist_grade_Unknown, -er_percentage_unknown, -pr_percentage_unknown)
+
+clinical_feats <- clinical |> 
+  select(-patient_index_deid, -primary_index_deid, -response, -subtype, -race) |> 
+  colnames()
+```
+
+```{r genomics_data}
+ancestry <- read_delim('raw_data/genomics/Ancestry_Label.full.txt') |> 
+  clean_names()
+
+genomics <- read_tsv('raw_data/Table_S5_MST_Genomics_v2.tsv') |> 
+  clean_names() |> 
+  mutate(is_pre_nac_impact = is_pre_nac_impact == 'Yes',
+         is_pcr = label == 'pCR',
+         is_wgd = wgd == 'Yes',
+         passed_facets_qc = facets_qc == 'Pass') |> 
+  mutate(patient_id = str_sub(tumor_sample_barcode, 1, 9)) |> 
+  mutate(across(c(is_pre_nac_impact, is_pcr, is_wgd, passed_facets_qc), as.numeric)) |> 
+  rename(subtype = molecular_subgroup) |> 
+  select(-label, -wgd, -facets_qc, -is_pcr) |> 
+  mutate(subtype = fct_recode(subtype,
+                              'HRposHER2neg' = 'HR+/HER2-',
+                              'HRnegHER2pos' = 'HR-/HER2+',
+                              'HRposHER2pos' = 'HR+/HER2+')) |> 
+  full_join(ancestry)
+
+
+
+genomics_feats <- genomics |>
+  select(-primary_index_deid, -patient_id, -tumor_sample_barcode, -subtype, -study_id, -ancestry_label) |> 
+  colnames()
+```
+
+```{r pathology_data}
+pathology <- read_csv('raw_data/cell_feature_table_extended_20241030.csv') |> 
+  clean_names() |> 
+  mutate(outcome = case_when(
+    outcome == "NpCR" ~ 0,
+    outcome == "pCR" ~ 1)) |> 
+  mutate(across(starts_with("count_"), ~ . / count_all, .names = "{gsub('count', 'frac', .col)}")) |> 
+  select(-starts_with('count_'), -frac_all) |> 
+  rename('response' = 'outcome') |> 
+  rename_with(~ gsub("^mean_", "", .), starts_with("mean_")) |> 
+  mutate(subtype = fct_recode(subtype,
+                              'HRposHER2neg' = 'HR+/HER2-',
+                              'HRnegHER2pos' = 'HR-/HER2+',
+                              'HRposHER2pos' = 'HR+/HER2+'))
+
+pathology_feats <- pathology |>
+  select(-primary_index_deid, -response, -subtype) |> 
+  colnames()
+```
+
+```{r}
+path_dl <- read_csv("raw_data/hist_train_set_probability_scores_20240313.csv") |> 
+  clean_names() |> 
+  select(-fold, -slide_id) |> 
+  rename(prob1_path = prob1)
+
+path_dl_tssv <- read_csv('raw_data/hist_train_set_ssm_probability_scores_20240320.csv') |> 
+  clean_names() |> 
+  select(-x1, -image_id_pre, -fold) |> 
+  mutate(model = case_when(model == 'train_HR+HER2+_split_20240311_s1' ~ 'HRposHER2pos',
+                           model == 'train_HR+HER2-_split_20240311_s1' ~ 'HRposHER2neg',
+                           model == 'train_HR-HER2+_split_20240311_s1' ~ 'HRnegHER2pos',
+                           model == 'train_TNBC_split_20240311_s1' ~ 'TNBC')) |> 
+  rename(train_subtype = model, 
+         prob1_path_tssv = prob1)
+
+path_dl <- path_dl |> 
+  full_join(path_dl_tssv)
+
+path_dl_feats <- path_dl |>
+  select(-primary_index_deid, -train_subtype) |> 
+  colnames()
+```
+
+```{r}
+rad_dl <- read_xlsx("raw_data/radiology_DL_results_trainingSet_forWill.xlsx", skip = 1) |> 
+  clean_names() |> 
+  rename(primary_index_deid = deid_acc,
+         response = truth, 
+         prob1_rad = pred_sub2_trained_on_all_subtypes) |> 
+  select(-mskacc, -fold, -tumor_subtype, -response) |> 
+  pivot_longer(pred_sub2_trained_on_hr_her2:pred_mip1_trained_on_tnbc, names_to = 'train_subtype', values_to = 'prob1_rad_tssv') |> 
+  drop_na() |> 
+  mutate(train_subtype = 
+           case_when(train_subtype == 'pred_mip1_trained_on_tnbc' ~ 'TNBC',
+                     train_subtype == 'pred_sub2_t2w_mip1_trained_on_hr_her2' ~ 'HRposHER2pos',
+                     train_subtype == 'pred_sub2_trained_on_hr_her2' ~ 'HRposHER2neg',
+                     train_subtype == 'pred_t2_trained_on_hr_her2' ~ 'HRnegHER2pos'))
+
+rad_dl_feats <- rad_dl |>
+  select(-primary_index_deid, -train_subtype) |> 
+  colnames()
+```
+
+```{r combination}
+master_table <- clinical |> 
+  full_join(genomics, by = c('primary_index_deid', 'subtype')) |> 
+  full_join(pathology, by = c('primary_index_deid', 'subtype', 'response')) |> 
+  full_join(path_dl, by = 'primary_index_deid') |> 
+  full_join(rad_dl, by = c('primary_index_deid')) |> 
+  filter(race != 'other') |> 
+  mutate(response = fct_rev(as.factor(response)))
+
+master_table |> 
+  write_csv('cooked_data/master_table.csv')
+```
+
+```{r get the individual tables}
+clinical_table <- master_table |> 
+  select(response, subtype, race, all_of(clinical_feats)) |> 
+  drop_na()
+
+genomics_table <- master_table |> 
+  select(response, subtype, race, all_of(genomics_feats)) |> 
+  drop_na()
+
+pathology_table <- master_table |> 
+  select(response, subtype, race, all_of(pathology_feats)) |> 
+  drop_na()
+
+path_dl_table <- master_table |> 
+  select(response, subtype, race, all_of(path_dl_feats)) |> 
+  drop_na()
+
+rad_dl_table <- master_table |> 
+  select(response, subtype, race, all_of(rad_dl_feats)) |> 
+  drop_na()
+```
