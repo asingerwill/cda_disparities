@@ -1,0 +1,505 @@
+---
+title: "abstract_race_modality_analysis"
+output: html_document
+date: "2024-11-12"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+subtypes <- c('HRnegHER2pos', 'HRposHER2neg', 'HRposHER2pos', 'TNBC')
+names(subtypes) <- subtypes
+
+make_predictor <- function(train_data) {
+  
+  train_data <- train_data |> 
+    select(-subtype)
+  
+  lasso_spec <- logistic_reg(penalty = tune(), mixture = 0) %>%
+    set_engine("glmnet")
+
+  lasso_recipe <- recipe(response ~ ., data = train_data) |> 
+    step_dummy(race, one_hot = T)
+  
+  lasso_workflow <- workflow() %>%
+    add_recipe(lasso_recipe) %>%
+    add_model(lasso_spec)
+  
+  val_folds <- vfold_cv(train_data, v = 5, strata = response)
+  
+  tune_grid <- grid_regular(penalty(), levels = 25)
+  
+  tuned_results <- tune_grid(
+    lasso_workflow,
+    resamples = val_folds,
+    grid = tune_grid,
+    control = control_grid(save_pred = TRUE)
+  )
+  
+  best_lambda <- select_best(tuned_results, metric = "roc_auc")
+  
+  final_lasso_workflow <- finalize_workflow(lasso_workflow, best_lambda)
+  
+  final_model <- fit(final_lasso_workflow, data = train_data)
+  
+  return(final_model)
+}
+
+get_splits <- function(subtype_to_split, proportion = .7) {
+  subtype_lasso_table <- lasso_table |> filter(subtype == subtype_to_split)
+  this_split <- initial_split(subtype_lasso_table, prop = proportion, strata = response)
+  train_data <- training(this_split)
+  test_data <- testing(this_split)
+  return(list(train = train_data, test = test_data))
+}
+
+get_predictions_by_race <- function(subtype_split, model) {
+  these_preds <- augment(model, subtype_split$test)
+  
+  aucs <- these_preds |> 
+    roc_auc(response, .pred_1) |> 
+    mutate(type = 'roc_auc',
+           race = 'all')
+  
+  race_aucs <- these_preds |> 
+    group_by(race) |> 
+    roc_auc(response, .pred_1) |> 
+    mutate(type = 'roc_auc')
+  
+  bind_rows(aucs, race_aucs)
+}
+
+do_experiment <- function(seed, broken_down_by_subtype = T, ...) {
+  set.seed(seed)
+  splits <- map(subtypes, ~ get_splits(.x, proportion = 0.5))
+  
+  all_training <- map(splits, 'train') |> 
+    list_rbind()
+  all_testing <- map(splits, 'test') |> 
+    list_rbind()
+  
+  splits$all$train <- all_training
+  splits$all$test <- all_testing
+  
+  model <- make_predictor(all_training)
+  
+  if (broken_down_by_subtype) {
+    preds_by_race <- map(splits, ~ get_predictions_by_race(.x, model)) |> 
+      list_rbind(names_to = 'test_subtype')
+  } else {
+    preds_by_race <- get_predictions_by_race(splits$all, model) |> 
+      mutate(test_subtype = 'all')
+  }
+
+  return(preds_by_race)
+}
+
+
+do_tssv_experiment <- function(seed) {
+  set.seed(seed)
+  splits <- map(subtypes, ~ get_splits(.x, proportion = 0.5))
+  
+  all_training <- map(splits, 'train') |> 
+    list_rbind()
+  all_testing <- map(splits, 'test') |> 
+    list_rbind()
+  
+  splits$all$train <- all_training
+  splits$all$test <- all_testing
+  
+  all_model <- make_predictor(splits$all$train)
+  hnhp_model <- make_predictor(splits$HRnegHER2pos$train)
+  hphn_model <- make_predictor(splits$HRposHER2neg$train)
+  hphp_model <- make_predictor(splits$HRposHER2pos$train)
+  tnbc_model <- make_predictor(splits$TNBC$train)
+  
+  all_res <- get_predictions_by_race(splits$all, all_model) |> 
+    mutate(train_subtype = 'all',
+           test_subtype = 'all')
+  
+  hnhp_res <- get_predictions_by_race(splits$HRnegHER2pos, hnhp_model) |> 
+    mutate(train_subtype = 'HRnegHER2pos',
+           test_subtype = 'HRnegHER2pos')
+  
+  hphn_res <- get_predictions_by_race(splits$HRposHER2neg, hphn_model) |> 
+    mutate(train_subtype = 'HRposHER2neg',
+           test_subtype = 'HRposHER2neg')
+  
+  hphp_res <- get_predictions_by_race(splits$HRposHER2pos, hphp_model) |> 
+    mutate(train_subtype = 'HRposHER2pos',
+           test_subtype = 'HRposHER2pos')
+  
+  tnbc_res <- get_predictions_by_race(splits$TNBC, tnbc_model) |> 
+    mutate(train_subtype = 'TNBC',
+           test_subtype = 'TNBC')
+  
+  res <- rbind(all_res, hnhp_res, hphn_res, hphp_res, tnbc_res)
+  
+  return(res)
+}
+
+safe_tssv_experiment <- safely(do_tssv_experiment)
+```
+
+```{r}
+race_colors <- c("asian" = "#e52026", "black" = "#f37e20", 
+                   "hispanic" = "#3180bb", "white" = "#4bb04a", 'all' = 'darkgray')
+
+subtype_colors <- c("HR+/HER2-" = "#1678b5", "HR+/HER2+" = "#a6cde2", 
+                   "HR-/HER2+" = "#f5989a", "TNBC" = "#e32127", 'All' = 'darkgray')
+
+
+make_bars_plot <- function(evals, title, with_error = T) {
+  p <- evals |> 
+  mutate(test_subtype =  fct_recode(test_subtype,
+                                   'All' = 'all',
+                                   'HR+/HER2-' = 'HRposHER2neg',
+                                   'HR-/HER2+' = 'HRnegHER2pos',
+                                   'HR+/HER2+' = 'HRposHER2pos')) |> 
+  filter(type == 'roc_auc') |> 
+  group_by(test_subtype, race) |> 
+  summarize(mean_est = median(.estimate, na.rm = T), 
+            upper = quantile(.estimate, .975, na.rm = T), 
+            lower = quantile(.estimate, .025, na.rm = T)) |> 
+  ggplot(aes(x = race, y = mean_est, fill = race)) +
+  geom_col() +
+  geom_hline(yintercept = 0.5, linewidth = 1, linetype = 'dashed') +
+  ylim(c(0,1)) +
+  facet_wrap(~test_subtype, nrow = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = race_colors) + 
+  ggh4x::facet_wrap2(~test_subtype, nrow = 1,
+                     strip = ggh4x::strip_themed(background_x = list(
+                       element_rect(fill = subtype_colors["All"]),
+                       element_rect(fill = subtype_colors["HR-/HER2+"]),
+                       element_rect(fill = subtype_colors["HR+/HER2-"]),
+                       element_rect(fill = subtype_colors["HR+/HER2+"]),
+                       element_rect(fill = subtype_colors["TNBC"])),
+                       text_x = list(
+                         element_text(size = 20, face = 'bold', color = "white"),
+                         element_text(size = 20, face = 'bold', color = "white"),
+                         element_text(size = 20, face = 'bold', color = "white"),
+                         element_text(size = 20, face = 'bold', color = "white")
+  ))) +
+  theme(axis.text = element_text(size = 15, face = 'bold', angle = 45, hjust = 1),
+        axis.title = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20, face = 'bold'),
+        title = element_text(size = 25, face = 'bold')) +
+  labs(x = '',
+       y = 'AUC',
+       fill = 'Model tested on...',
+       title = title)
+  
+  if (with_error) p <- p + geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3)
+  
+  return(p)
+}
+```
+
+```{r}
+lasso_table <- clinical_table
+
+safe_experiment <- safely(do_experiment)
+
+clin_gv_results_raw <- map(1:25, safe_experiment, .progress = T)
+
+clin_gv_results <- map(clin_gv_results_raw, ~ if (is.null(.x$error)) .x$result else NULL) |> 
+  compact() |> 
+  list_rbind(names_to = 'seed')
+
+clin_feats_gv <- make_bars_plot(clin_gv_results, 'AUC bar plot for clinical features GV, tested by subtype and race')
+```
+
+```{r}
+lasso_table <- clinical_table
+
+clin_tssv_results_raw <- map(1:25, safe_tssv_experiment, .progress = T)
+
+clin_tssv_results <- map(clin_tssv_results_raw, ~ if (is.null(.x$error)) .x$result else NULL) |> 
+  compact() |> 
+  list_rbind(names_to = 'seed')
+
+clin_feats_tssv <- make_bars_plot(clin_tssv_results, 'AUC bar plot for clinical features TSSV, tested by subtype and race')
+```
+
+```{r}
+lasso_table <- genomics_table
+
+safe_experiment <- safely( ~ do_experiment(.x, broken_down_by_subtype = F))
+
+genomic_gv_results_raw <- map(1:25, safe_experiment, .progress = T)
+
+genomic_gv_results <- map(genomic_gv_results_raw, ~ if (is.null(.x$error)) .x$result else NULL) |> 
+  compact() |> 
+  list_rbind(names_to = 'seed')
+
+genomic_feats_gv <- make_bars_plot(genomic_gv_results, 'AUC bar plot for pathology features GV, tested by subtype and race')
+```
+
+```{r}
+these_preds <- path_dl_table |> 
+  rename(.pred_1 = prob1_path,
+         test_subtype = subtype) |> 
+  mutate(.pred_0 = 1 - .pred_1,
+         .pred_class = ifelse(.pred_1 >= .5, 1, 0))
+
+all_all_aucs <- these_preds |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all',
+         race = 'all')
+
+st_all_aucs <- these_preds |> 
+  group_by(race) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all')
+
+r_all_aucs <- these_preds |> 
+  group_by(test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc',
+         race = 'all')
+
+aucs <- these_preds |> 
+  group_by(race, test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc')
+
+path_dl_gv_results <- bind_rows(all_all_aucs, st_all_aucs, r_all_aucs, aucs) |> 
+  mutate(feats = 'path_dl', version = 'gv')
+
+path_dl_gv <- make_bars_plot(path_dl_gv_results, 'AUC bar plot for pathology DL GV, tested by subtype and race', with_error = F)
+```
+
+```{r}
+these_tssv_preds <- path_dl_table |> 
+  mutate(.pred_1 = prob1_path_tssv) |> 
+  mutate(train_subtype = subtype,
+         test_subtype = subtype) |> 
+  mutate(.pred_0 = 1 - .pred_1,
+         .pred_class = ifelse(.pred_1 >= .5, 1, 0))
+
+all_all_aucs <- these_preds |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all',
+         race = 'all')
+
+st_all_aucs <- these_preds |> 
+  group_by(race) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all')
+
+r_all_aucs <- these_tssv_preds |> 
+  group_by(test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc',
+         race = 'all')
+
+aucs <- these_tssv_preds |> 
+  group_by(race, test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc')
+
+path_dl_tssv_results <- bind_rows(all_all_aucs, st_all_aucs, r_all_aucs, aucs) |> 
+  select(test_subtype, race, .estimate) |> 
+  mutate(feats = 'path_dl', version = 'tssv') |> 
+  mutate(type = 'roc_auc')
+
+path_dl_tssv <- make_bars_plot(path_dl_tssv_results, 'AUC bar plot for pathology DL TSSV, tested by subtype and race', with_error = F)
+```
+
+```{r}
+these_preds <- rad_dl_table |> 
+  rename(.pred_1 = prob1_rad,
+         test_subtype = subtype) |> 
+  mutate(.pred_0 = 1 - .pred_1,
+         .pred_class = ifelse(.pred_1 >= .5, 1, 0))
+
+all_all_aucs <- these_preds |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all',
+         race = 'all')
+
+st_all_aucs <- these_preds |> 
+  group_by(race) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all')
+
+r_all_aucs <- these_preds |> 
+  group_by(test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc',
+         race = 'all')
+
+aucs <- these_preds |> 
+  group_by(race, test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc')
+
+rad_dl_gv_results <- bind_rows(all_all_aucs, st_all_aucs, r_all_aucs, aucs) |> 
+  mutate(feats = 'rad_dl', version = 'gv')
+
+rad_dl_gv <- make_bars_plot(rad_dl_gv_results, 'AUC bar plot for radiology DL GV, tested by subtype and race', with_error = F)
+```
+
+```{r}
+these_tssv_preds <- rad_dl_table |> 
+  mutate(.pred_1 = prob1_rad_tssv) |> 
+  mutate(train_subtype = subtype,
+         test_subtype = subtype) |> 
+  mutate(.pred_0 = 1 - .pred_1,
+         .pred_class = ifelse(.pred_1 >= .5, 1, 0))
+
+all_all_aucs <- these_preds |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all',
+         race = 'all')
+
+st_all_aucs <- these_preds |> 
+  group_by(race) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all')
+
+r_all_aucs <- these_tssv_preds |> 
+  group_by(test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc',
+         race = 'all')
+
+aucs <- these_tssv_preds |> 
+  group_by(race, test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc')
+
+rad_dl_tssv_results <- bind_rows(all_all_aucs, st_all_aucs, r_all_aucs, aucs) |> 
+  select(test_subtype, race, .estimate) |> 
+  mutate(feats = 'rad_dl', version = 'tssv') |> 
+  mutate(type = 'roc_auc')
+
+rad_dl_tssv <- make_bars_plot(rad_dl_tssv_results, 'AUC bar plot for radology DL TSSV, tested by subtype and race', with_error = F)
+```
+
+```{r}
+these_preds <- integration_results |> 
+  select(.pred_1, .pred_0, .pred_class, race, subtype, response) |> 
+  rename(test_subtype = subtype)
+
+all_all_aucs <- these_preds |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all',
+         race = 'all')
+
+st_all_aucs <- these_preds |> 
+  group_by(race) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc') |> 
+  mutate(test_subtype = 'all')
+
+r_all_aucs <- these_preds |> 
+  group_by(test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc',
+         race = 'all')
+
+aucs <- these_preds |> 
+  group_by(race, test_subtype) |> 
+  roc_auc(response, .pred_1) |> 
+  mutate(type = 'roc_auc')
+
+int_gv_results <- bind_rows(all_all_aucs, st_all_aucs, r_all_aucs, aucs) |> 
+  mutate(feats = 'integration', version = 'gv')
+
+int_gv <- make_bars_plot(int_gv_results, 'AUC bar plot for pathology DL GV, tested by subtype and race', with_error = F)
+```
+
+```{r}
+ggsave("products/images/11_14/clin_feats_gv.png", plot = clin_feats_gv, width = 16, height = 5) 
+ggsave("products/images/11_14/path_feats_gv.png", plot = path_feats_gv, width = 16, height = 5)
+ggsave("products/images/11_14/path_dl_gv.png", plot = path_dl_gv, width = 16, height = 5)
+ggsave("products/images/11_14/rad_dl_gv.png", plot = rad_dl_gv, width = 16, height = 5)  
+
+ggsave("products/images/11_14/clin_feats_tssv.png", plot = clin_feats_tssv, width = 16, height = 5) 
+ggsave("products/images/11_14/path_feats_tssv.png", plot = path_feats_tssv, width = 16, height = 5)
+ggsave("products/images/11_14/path_dl_tssv.png", plot = path_dl_tssv, width = 16, height = 5)
+ggsave("products/images/11_14/rad_dl_tssv.png", plot = rad_dl_tssv, width = 16, height = 5)  
+```
+
+```{r compare_table}
+clin_gv_tab <- clin_gv_results |> 
+  filter(type == 'roc_auc') |> 
+  group_by(race, test_subtype) |>
+  summarize(.estimate = median(.estimate, na.rm = T)) |> 
+  ungroup() |> 
+  mutate(feats = 'clin', version = 'gv')
+
+clin_tssv_tab <- clin_tssv_results |> 
+  filter(type == 'roc_auc') |> 
+  group_by(race, test_subtype) |>
+  summarize(.estimate = median(.estimate, na.rm = T)) |> 
+  ungroup() |> 
+  mutate(feats = 'clin', version = 'tssv')
+  
+genomic_gv_tab <- genomic_gv_results |> 
+  filter(type == 'roc_auc') |> 
+  group_by(race, test_subtype) |>
+  summarize(.estimate = median(.estimate, na.rm = T)) |> 
+  ungroup() |> 
+  mutate(feats = 'gen', version = 'gv')
+
+path_dl_gv_tab <- path_dl_gv_results |> 
+  select(race, test_subtype, .estimate, feats, version)
+
+path_dl_tssv_tab <- path_dl_tssv_results |> 
+  select(race, test_subtype, .estimate, feats, version)
+
+rad_dl_gv_tab <- rad_dl_gv_results |> 
+  select(race, test_subtype, .estimate, feats, version)
+
+rad_dl_tssv_tab <- rad_dl_tssv_results |> 
+  select(race, test_subtype, .estimate, feats, version)
+
+int_gv_tab <- int_gv_results |> 
+  select(race, test_subtype, .estimate, feats, version)
+
+auc_results <- bind_rows(clin_gv_tab, clin_tssv_tab, genomic_gv_tab,
+                         path_dl_gv_tab, path_dl_tssv_tab, 
+                         rad_dl_gv_tab, rad_dl_tssv_tab,
+                         int_gv_tab)
+
+auc_results |> 
+  write_csv('cooked_data/auc_results.csv')
+```
+
+```{r}
+auc_results |> 
+  filter(version == 'gv') |> 
+  mutate(feats = fct_relevel(feats, 'gen', after = Inf),
+         feats = fct_relevel(feats, 'integration')) |> 
+  ggplot(aes(x = test_subtype, y = feats, fill = .estimate)) +
+  geom_tile() +
+  geom_text(aes(label = .estimate), color = "black") +  # Add text labels
+  facet_wrap(vars(race), nrow = 5) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "forestgreen", midpoint = 0.5)
+```
+
+```{r}
+auc_results |> 
+  filter(version == 'gv') |> 
+  mutate(feats = fct_relevel(feats, 'gen'),
+         feats = fct_relevel(feats, 'integration', after = Inf)) |> 
+  ggplot(aes(x = test_subtype, y = race, fill = .estimate)) +
+  geom_tile() +
+  geom_text(aes(label = .estimate), color = "black") +  # Add text labels
+  facet_wrap(vars(feats), nrow = 5) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "forestgreen", midpoint = 0.5)
+```
+
